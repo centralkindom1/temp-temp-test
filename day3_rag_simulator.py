@@ -212,8 +212,9 @@ class RAGSimulatorGUI:
     # --- 核心逻辑：从数据库(仓库)加载数据 ---
     def reload_memory_db(self):
         """
-        连接 DB，拉取 embedding_json, full_context_text 和 pure_text 到内存。
+        ✨ 方案 2 修复版本：连接 DB，拉取 embedding_json, full_context_text 和 pure_text 到内存。
         支持从 UI 输入框动态读取 DB 路径。
+        增强的数据验证和修复能力。
         """
         # 1. 获取界面上配置的 DB 路径
         target_db_path = self.db_path_entry.get().strip()
@@ -242,17 +243,29 @@ class RAGSimulatorGUI:
             self.db_status_label.config(text=f"状态: 空数据库 | Path: {os.path.basename(target_db_path)}", fg="#ff8800")
             return
 
-        # 4. 转换数据格式
+        # 4. 转换数据格式 + 增强的数据完整性检查
         self.memory_vectors = []
+        skip_count = 0
+        
         for item in raw_data:
             try:
+                # ✨ 额外的数据完整性检查
+                if not item.get('pure_text') or not item['pure_text'].strip():
+                    self.log(f"⚠️ 警告：记录 {item['id'][:8]}... 缺少有效的 pure_text，已跳过")
+                    skip_count += 1
+                    continue
+                
                 item['np_vector'] = np.array(item['vector'])
                 self.memory_vectors.append(item)
             except Exception as e:
-                print(f"Skipping bad vector: {e}")
+                self.log(f"⚠️ 警告：处理记录 {item.get('id', 'unknown')[:8]}... 时出错: {e}")
+                skip_count += 1
+                continue
             
         count = len(self.memory_vectors)
-        self.log(f"数据库挂载成功！内存索引已构建，共 {count} 条数据。")
+        if skip_count > 0:
+            self.log(f"[Info] 数据库挂载成功！已跳过 {skip_count} 条损坏记录。")
+        self.log(f"[Success] 内存索引已构建，共 {count} 条有效数据可用。")
         self.db_status_label.config(text=f"状态: 已挂载 ✅ | 索引量: {count} 条", fg="green")
 
     # --- 线程工作逻辑：入库 (JSON -> API -> DB) ---
@@ -282,6 +295,10 @@ class RAGSimulatorGUI:
         ).start()
 
     def run_ingestion(self, json_path, api_config, batch_size, max_workers):
+        """
+        ✨ 方案 2 修复版本：批量入库逻辑
+        核心改进：在处理 batch 时，优先从 JSON 的 pure_text 读取，实现多级降级策略
+        """
         try:
             self.log("正在解析 JSON 文件...")
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -289,6 +306,11 @@ class RAGSimulatorGUI:
             
             total_items = len(data)
             self.log(f"解析成功，共 {total_items} 条数据待处理。")
+            
+            # 数据检查：扫描 JSON 中是否包含 pure_text 字段
+            sample_item = data[0] if data else {}
+            has_pure_text = 'pure_text' in sample_item
+            self.log(f"[Info] JSON 数据结构检查：pure_text 字段 {'✅ 已包含' if has_pure_text else '❌ 缺失'}")
             
             batches = []
             for i in range(0, total_items, batch_size):
@@ -305,9 +327,13 @@ class RAGSimulatorGUI:
             lock = threading.Lock()
             
             def process_batch(batch_info):
+                """
+                ✨ 核心处理函数：实现方案 2 的多级降级策略
+                """
                 texts = batch_info['texts']
                 def thread_logger(msg):
-                    if "Error" in msg: self.log(msg)
+                    if "Error" in msg or "error" in msg: 
+                        self.log(msg)
                 
                 try:
                     vectors = self.adapter.get_embeddings(texts, provider_config=api_config, logger=thread_logger)
@@ -324,12 +350,32 @@ class RAGSimulatorGUI:
                         record['chapter_title_temp'] = h1
                         record['sub_title_temp'] = h2
                         
-                        raw_content = item.get('embedding_text', "")
-                        if "Content: " in raw_content:
-                            pure = raw_content.split("Content: ", 1)[1]
+                        # ✨ 方案 2 的核心修复：多级降级策略获取 pure_text
+                        pure_text = ""
+                        
+                        # 第一优先级：直接从 JSON 的 pure_text 字段读取
+                        if 'pure_text' in item and item['pure_text']:
+                            pure_text = item['pure_text'].strip()
+                            
+                        # 第二优先级：从 metadata 中读取
+                        elif 'pure_text' in meta and meta['pure_text']:
+                            pure_text = meta['pure_text'].strip()
+                        
+                        # 第三优先级：从 embedding_text 分割提取
                         else:
-                            pure = raw_content
-                        meta['pure_text_temp'] = pure
+                            embedding_text = item.get('embedding_text', '')
+                            if "Content: " in embedding_text:
+                                pure_text = embedding_text.split("Content: ", 1)[1].strip()
+                            else:
+                                pure_text = embedding_text.strip()
+                        
+                        # 最后保底：确保 pure_text 不为空
+                        if not pure_text:
+                            pure_text = item.get('embedding_text', '').strip()
+                        
+                        # 将处理后的 pure_text 保存到 metadata 和 record，供后续 bulk_insert 使用
+                        meta['pure_text'] = pure_text
+                        record['metadata'] = meta
                         
                         result_records.append(record)
                     return result_records
@@ -347,7 +393,7 @@ class RAGSimulatorGUI:
                     if results:
                         with lock:
                             # 这里调用 backend 的 bulk_insert，数据真正存入 Warehouse (DB)
-                            # 注意：入库时使用的是 db_conn 当前的路径，如果刚才用户改了路径，就会入库到新文件
+                            # bulk_insert 内部已经集成了方案 2 的逻辑
                             self.db_conn.bulk_insert(results)
                             processed_data.extend(results)
                             processed_count += len(results)
@@ -358,18 +404,25 @@ class RAGSimulatorGUI:
                             if processed_count % (batch_size * 2) == 0:
                                 self.log(f"进度: {processed_count}/{total_items} 已入库")
             
+            self.log("="*50)
             self.log("入库任务全部完成！数据已安全存入数据库。")
-            self.msg_queue.put(("STATUS_DONE", f"入库成功！共 {len(processed_data)} 条数据。\n已存入 DB。"))
+            self.log(f"总处理数: {len(processed_data)} | 成功率: {len(processed_data)/total_items*100:.1f}%")
+            self.log("="*50)
+            self.msg_queue.put(("STATUS_DONE", f"入库成功！共 {len(processed_data)} 条数据。\n已存入 DB，ready for RAG simulation."))
             
         except Exception as e:
             import traceback
             err = traceback.format_exc()
             self.log(f"FATAL ERROR: {str(e)}")
             print(err)
-            self.msg_queue.put(("ERROR", f"处理异常: {str(e)}"))
+            self.msg_queue.put(("ERROR", f"���理异常: {str(e)}"))
 
     # --- 仿真搜索逻辑 (Read from DB Memory) ---
     def run_simulation(self):
+        """
+        ✨ 方案 2 修复版本：RAG 仿真搜索
+        使用从数据库加载的、经过验证的 pure_text 和 full_context_text 进行召回
+        """
         query = self.query_entry.get()
         if not query: return
         
@@ -414,7 +467,7 @@ class RAGSimulatorGUI:
         self.result_area.insert(tk.END, f"\n{'='*20} 仿真召回结果 (Top 3) {'='*20}\n")
         
         current_db_name = os.path.basename(self.db_path_entry.get())
-        self.result_area.insert(tk.END, f"数据源: {current_db_name} (Pure Text Fusion)\n\n", "source_db")
+        self.result_area.insert(tk.END, f"数据源: {current_db_name} (Pure Text Fusion - Method 2 Enhanced)\n\n", "source_db")
         
         if not top_k:
             self.result_area.insert(tk.END, "无匹配结果。\n")
@@ -430,6 +483,7 @@ class RAGSimulatorGUI:
             self.result_area.insert(tk.END, title_text, "title_hit")
             
             # 2. 融合内容展示 (Full Context Header + Pure Text Body)
+            # ✨ 方案 2 修复：pure_text 现在是直接从数据库读取的、经过验证的值
             full_context = item['text']
             pure_text_body = item.get('pure_text', "")
             
@@ -443,11 +497,11 @@ class RAGSimulatorGUI:
             # 显示 Header
             self.result_area.insert(tk.END, f"[Full Context Header]:\n{header_text}\n", "meta")
             
-            # 显示 Body (优先使用 Pure Text，回退到分割法)
+            # 显示 Body (优先使用经过验证的 Pure Text)
             if pure_text_body and len(pure_text_body.strip()) > 0:
-                 self.result_area.insert(tk.END, f"[Pure Text Body]:\n{pure_text_body.strip()}\n", "pure_body")
+                 self.result_area.insert(tk.END, f"[Pure Text Body - DB Source]:\n{pure_text_body.strip()}\n", "pure_body")
             elif "Content: " in full_context:
-                 # Fallback
+                 # Fallback (不应该到这里，如果数据库加载正常)
                  fallback_body = full_context.split("Content: ", 1)[1]
                  self.result_area.insert(tk.END, f"[Body (Fallback)]:\n{fallback_body.strip()}\n")
             else:

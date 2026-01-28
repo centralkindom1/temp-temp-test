@@ -4,7 +4,7 @@ import os
 class Config:
     # === 默认配置 (内网) ===
     INTRANET_API_URL = "https://aiplus.airchina.com.cn:18080/v1/embeddings"
-    INTRANET_API_KEY = "your api key"
+    INTRANET_API_KEY = "sk-fXM4W0CdcKnNp3NVDfF85f2b90284b11AfDdF9F5627f627b"
     INTRANET_MODEL_NAME = "bge-m3"
 
     # === 硅基流动配置 (SiliconFlow) ===
@@ -26,5 +26,4 @@ class Config:
     # === 向量化默认配置 ===
     DEFAULT_BATCH_SIZE = 8 # 默认批处理大小
     DEFAULT_CONCURRENCY = 2 # 默认并发数
-
     EMBEDDING_DIM = 1024 # BGE-M3 维度

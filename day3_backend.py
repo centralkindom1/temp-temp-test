@@ -97,6 +97,11 @@ class DBConnector:
     """
     数据库连接器
     负责 Schema 管理与数据持久化
+    
+    ✨ Method 2 Enhanced 版本：
+    - 从 JSON 的 pure_text 字段直接读取（Day 2 已经保证完整性）
+    - 不再依赖字符串分割
+    - 增强的数据验证
     """
     def __init__(self):
         self.db_path = Config.DB_PATH
@@ -149,7 +154,10 @@ class DBConnector:
             conn.close()
 
     def bulk_insert(self, records):
-        """批量插入数据 (使用 REPLACE INTO)"""
+        """
+        ✨ Method 2 Enhanced 版本：批量插入数据
+        核心改进：从 JSON 的 pure_text 直接读取，不再二次加工
+        """
         if not records:
             return
             
@@ -160,6 +168,34 @@ class DBConnector:
             for r in records:
                 meta = r.get('metadata', {})
                 embedding_json = json.dumps(r.get('embedding', []))
+                
+                # ✨ 核心修复：优先级列表获取 pure_text
+                # 由于 Day 2 已经在 JSON 中保存了 pure_text，这里应该直接读取
+                pure_text = ""
+                
+                # 第 1 优先级：JSON 顶层的 pure_text（Day 2 新增）
+                if 'pure_text' in r and r['pure_text']:
+                    pure_text = r['pure_text'].strip()
+                
+                # 第 2 优先级：metadata 中的 pure_text（Day 2 备份）
+                elif 'pure_text' in meta and meta['pure_text']:
+                    pure_text = meta['pure_text'].strip()
+                
+                # 第 3 优先级：从 embedding_text 分割（兼容旧版 Day 2）
+                else:
+                    embedding_text = r.get('embedding_text', '')
+                    if "Content: " in embedding_text:
+                        pure_text = embedding_text.split("Content: ", 1)[1].strip()
+                    else:
+                        pure_text = embedding_text.strip()
+                
+                # 最后保底：确保不为空
+                if not pure_text:
+                    pure_text = r.get('embedding_text', '').strip()
+                
+                # 数据质量检查：如果 pure_text 太短，可能是损坏
+                if len(pure_text) < 10:
+                    print(f"[Warning] 记录的 pure_text 过短（{len(pure_text)} 字符），可能数据损坏")
                 
                 # 确保字段顺序与表结构一致
                 c.execute('''
@@ -173,7 +209,7 @@ class DBConnector:
                     r.get('chapter_title_temp', ''),    
                     r.get('sub_title_temp', ''),        
                     r.get('embedding_text', ''),        
-                    meta.get('pure_text_temp', ''),     
+                    pure_text,                          # ✨ 使用从 JSON 读取的 pure_text
                     meta.get('page_num', 0),
                     meta.get('char_count', 0),
                     meta.get('strategy', 'Unknown'),
@@ -189,8 +225,8 @@ class DBConnector:
 
     def fetch_all_vectors(self):
         """
-        拉取所有向量用于仿真器内存计算
-        具备极其严格的列检查，防止崩溃
+        ✨ Method 2 Enhanced 版本：拉取所有向量用于仿真器内存计算
+        具备严格的列检查和数据修复能力
         """
         conn = self.get_connection()
         conn.row_factory = sqlite3.Row
@@ -204,7 +240,7 @@ class DBConnector:
                 print("[DB Warning] 表中缺少 embedding_json 列，无法加载向量。")
                 return []
 
-            # 2. 执行查询 (新增: 显式查询 pure_text)
+            # 2. 执行查询 (显式查询 pure_text，确保数据完整性)
             c.execute("""
                 SELECT chunk_uuid, full_context_text, pure_text, embedding_json, doc_title, chapter_title, sub_title 
                 FROM chunks_full_index 
@@ -213,21 +249,49 @@ class DBConnector:
             rows = c.fetchall()
             
             results = []
+            repair_count = 0
+            skip_count = 0
+            
             for row in rows:
                 try:
                     vec_data = json.loads(row['embedding_json'])
-                    if vec_data: # 确保向量非空
+                    if vec_data:  # 确保向量非空
+                        # ✨ Method 2 Enhanced：在加载时验证 pure_text 数据完整性
+                        pure_text = row['pure_text']
+                        
+                        # 如果 pure_text 为空或过短，尝试从 full_context_text 修复
+                        if not pure_text or len(pure_text.strip()) < 5:
+                            full_text = row['full_context_text'] or ""
+                            if "Content: " in full_text:
+                                pure_text = full_text.split("Content: ", 1)[1].strip()
+                                if len(pure_text) > 5:
+                                    repair_count += 1
+                                else:
+                                    skip_count += 1
+                                    print(f"[DB Warning] 记录 {row['chunk_uuid'][:8]}... 的 pure_text 无法修复，已跳过")
+                                    continue
+                            else:
+                                # 无法修复，跳过此记录
+                                skip_count += 1
+                                print(f"[DB Warning] 记录 {row['chunk_uuid'][:8]}... 的 pure_text 损坏且无法修复，已跳过")
+                                continue
+                        
                         results.append({
                             'id': row['chunk_uuid'],
                             'text': row['full_context_text'],
-                            'pure_text': row['pure_text'], # 核心修改: 提取纯文本
+                            'pure_text': pure_text,  # ✨ 经过验证和修复的纯文本
                             'vector': vec_data,
                             'doc': row['doc_title'],
                             'chapter': row['chapter_title'],
                             'sub': row['sub_title']
                         })
                 except json.JSONDecodeError:
-                    continue # 跳过损坏的 JSON 数据
+                    continue  # 跳过损坏的 JSON 数据
+            
+            if repair_count > 0:
+                print(f"[DB Info] 已自动修复 {repair_count} 条损坏的 pure_text 记录")
+            if skip_count > 0:
+                print(f"[DB Info] 已跳过 {skip_count} 条无法修复的记录")
             
             return results
             

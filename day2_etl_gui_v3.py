@@ -8,7 +8,7 @@ import os
 import queue
 from datetime import datetime
 
-# 复用 Day 1 的解析器 (确保 pdf_structure_parser.py 在同级目录)
+# 复用 Day 1 ��解析器 (确保 pdf_structure_parser.py 在同级目录)
 from pdf_structure_parser import PDFStructureParser
 from config import RAGConfig as Day1Config
 
@@ -89,13 +89,23 @@ class DBManager:
 # ==========================================
 class SmartChunker:
     """
-    负责执行 800字切分策略与 JSON 组装
+    ✨ 方案 2 修复版本：Day 2 的切片逻辑
+    核心改进：
+    1. 在 JSON 记录中显式包含 pure_text 字段
+    2. 确保 pure_text 包含完整的段落内容（不含标题）
+    3. embedding_text 包含完整的标题+内容
     """
+    
     @staticmethod
     def process_paragraph(doc_title, h1, h2, paragraph_text, page_num):
         """
         输入：文档名, 当前H1, 当前H2, 正文段落, 页码
         输出：一个列表，包含1个或多个切片字典 (DB格式 + JSON格式)
+        
+        ✨ 核心修复：
+        - paragraph_text 是原始的、完整的段落文本
+        - 我们在此处就明确分离出 pure_text 和 embedding_text
+        - 确保 pure_text 在整个流转过程中不会丢失
         """
         results = []
         text_len = len(paragraph_text)
@@ -120,23 +130,31 @@ class SmartChunker:
             part_id = 1
             step = Day2Config.SPLIT_WINDOW_SIZE - Day2Config.SPLIT_OVERLAP
             
+            # 计算总共会切成几段
+            total_parts = 0
+            temp_start = 0
+            while temp_start < text_len:
+                total_parts += 1
+                temp_start += step
+            
             while start < text_len:
                 end = min(start + Day2Config.SPLIT_WINDOW_SIZE, text_len)
                 sub_text = paragraph_text[start:end]
                 
                 chunks_to_create.append({
                     "text": sub_text,
-                    "strategy": f"Split_{part_id}_window_{Day2Config.SPLIT_WINDOW_SIZE}",
+                    "strategy": f"Split_{part_id}_of_{total_parts}",
                     "split_id": part_id
                 })
                 
-                if end == text_len: break
+                if end == text_len: 
+                    break
                 start += step
                 part_id += 1
 
         # --- 组装数据对象 ---
         for item in chunks_to_create:
-            pure_text = item['text']
+            pure_text = item['text']  # ✨ 直接使用切片后的纯文本
             
             # 核心：全量上下文融合
             # 格式：Document -> Chapter -> Section -> Content
@@ -156,15 +174,17 @@ class SmartChunker:
                 "chapter_title": h1 or "",
                 "sub_title": h2 or "",
                 "full_context_text": embedding_text,
-                "pure_text": pure_text,
+                "pure_text": pure_text,  # ✨ 保证完整
                 "page_num": page_num,
                 "char_count": len(pure_text),
                 "strategy_tag": item['strategy']
             }
             
-            # 2. JSON 记录格式 (嵌套，适配 BGE)
+            # 2. JSON 记录格式 (嵌套，适配 BGE + Day 3)
+            # ✨ 关键修复：在 JSON 中显式包含 pure_text 字段
             json_record = {
                 "embedding_text": embedding_text,
+                "pure_text": pure_text,  # ✨ 新增：直接在 JSON 中保存 pure_text
                 "section_hint": section_path_str,
                 "metadata": {
                     "doc_title": doc_title,
@@ -173,9 +193,10 @@ class SmartChunker:
                     "page_num": page_num,
                     "char_count": len(pure_text),
                     "strategy": item['strategy'],
-                    "split_id": item['split_id']
+                    "split_id": item['split_id'],
+                    "pure_text": pure_text  # ✨ 也在 metadata 中备份
                 },
-                "original_snippet": embedding_text 
+                "original_snippet": section_path_str  # ✨ 简化为路径字符串
             }
             
             results.append({"db": db_record, "json": json_record})
@@ -227,21 +248,27 @@ class ETLWorker(threading.Thread):
             current_h2 = None
             total_chunks = 0
             
+            # ✨ 新增：数据质量统计
+            total_input_chars = 0
+            total_output_chars = 0
+            
             # 状态机循环
             for i, block in enumerate(parsed_blocks):
                 # 更新上下文状态
                 if block.role == 'H1':
                     current_h1 = block.text
                     current_h2 = None # 切换章节时重置子标题
-                    self.msg_q.put(("LOG", f">> 锁定一级标题: {current_h1[:20]}..."))
+                    self.msg_q.put(("LOG", f">> 锁定一级标题: {current_h1[:30]}..."))
                     continue
                 elif block.role == 'H2':
                     current_h2 = block.text
-                    self.msg_q.put(("LOG", f"  > 锁定二级标题: {current_h2[:20]}..."))
+                    self.msg_q.put(("LOG", f"  > 锁定二级标题: {current_h2[:30]}..."))
                     continue
                 
                 # 处理正文 (BODY)
                 if block.role == 'BODY':
+                    total_input_chars += len(block.text)
+                    
                     # 调用智能切分器
                     packets = SmartChunker.process_paragraph(
                         doc_title=doc_title,
@@ -255,8 +282,9 @@ class ETLWorker(threading.Thread):
                         db_manager.insert_chunk(p['db'])
                         json_output.append(p['json'])
                         total_chunks += 1
+                        total_output_chars += len(p['db']['pure_text'])
                         
-                        # 实时发送前几个切片给 GUI 做“切片显微镜”展示
+                        # 实时发送前几个切片给 GUI 做"切片显微镜"展示
                         if total_chunks <= 5 or total_chunks % 10 == 0:
                             self.msg_q.put(("PREVIEW", p['json']))
 
@@ -268,12 +296,16 @@ class ETLWorker(threading.Thread):
             with open(Day2Config.JSON_OUTPUT_PATH, 'w', encoding='utf-8') as f:
                 json.dump(json_output, f, ensure_ascii=False, indent=2)
                 
-            self.msg_q.put(("LOG", "="*40))
+            self.msg_q.put(("LOG", "="*50))
             self.msg_q.put(("LOG", f"[SUCCESS] ETL 完成!"))
             self.msg_q.put(("LOG", f"总输入块数: {len(parsed_blocks)}"))
             self.msg_q.put(("LOG", f"总输出切片: {total_chunks}"))
+            self.msg_q.put(("LOG", f"输入总字数: {total_input_chars}"))
+            self.msg_q.put(("LOG", f"输出总字数: {total_output_chars}"))
+            self.msg_q.put(("LOG", f"数据完整率: {total_output_chars/max(total_input_chars, 1)*100:.1f}%"))
             self.msg_q.put(("LOG", f"数据库: {Day2Config.DB_PATH}"))
             self.msg_q.put(("LOG", f"语料JSON: {Day2Config.JSON_OUTPUT_PATH}"))
+            self.msg_q.put(("LOG", "="*50))
             
             self.callback(True)
 
@@ -290,7 +322,7 @@ class ETLWorker(threading.Thread):
 class Day2GUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Day 2: 结构化组装与切片显微镜 (Gemini V2)")
+        self.root.title("Day 2: 结构化组装与切片显微镜 (Gemini V2 - Method 2 Enhanced)")
         self.root.geometry("1100x700")
         
         # 消息队列用于线程通信
@@ -309,7 +341,7 @@ class Day2GUI:
         self.path_entry.pack(side="left", padx=5)
         tk.Button(top_frame, text="浏览...", command=self.browse_file).pack(side="left")
 
-        # 默认使用 Day 1 的配置逻辑，默认开启 OCR
+        # 默认使用 Day 1 的��置逻辑，默认开启 OCR
         self.ocr_var = tk.BooleanVar(value=True)
         self.ocr_check = tk.Checkbutton(top_frame, text="启用 Tesseract OCR (继承 Day 1)", variable=self.ocr_var, bg="#f0f0f0")
         self.ocr_check.pack(side="left", padx=10)
@@ -337,8 +369,8 @@ class Day2GUI:
         self.preview_text = scrolledtext.ScrolledText(right_frame, wrap=tk.WORD, bg="#ffffee", font=("Segoe UI", 10))
         self.preview_text.pack(fill="both", expand=True)
         # 添加标签说明
-        info_lbl = tk.Label(right_frame, text="此处显示实时生成的 JSON 切片，验证 H1/H2 是否正确粘连", fg="blue", bg="#ffffee")
-        info_lbl.place(relx=1.0, rely=0.0, anchor="ne")
+        info_lbl = tk.Label(right_frame, text="✨ Method 2 Enhanced: 此处显示 pure_text 字段，验证数据完整性", fg="blue", bg="#ffffee", font=("Segoe UI", 9, "bold"))
+        info_lbl.pack(side="bottom", fill="x")
 
     def browse_file(self):
         fn = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
@@ -353,12 +385,27 @@ class Day2GUI:
         self.console.configure(state="disabled")
 
     def show_preview(self, json_data):
-        """在显微镜窗口高亮显示切片信息"""
-        self.preview_text.insert(tk.END, f"\n{'='*20} 新切片生成 {'='*20}\n", "header")
+        """
+        ✨ 增强的预览显示：重点展示 pure_text 字段
+        """
+        self.preview_text.insert(tk.END, f"\n{'='*60} 新切片生成 {'='*60}\n", "header")
         
-        # 格式化 JSON 显示
-        formatted_json = json.dumps(json_data, indent=2, ensure_ascii=False)
-        self.preview_text.insert(tk.END, formatted_json + "\n")
+        # 关键字段高亮显示
+        self.preview_text.insert(tk.END, f"UUID: {json_data.get('metadata', {}).get('section_id', 'N/A')[:12]}...\n", "info")
+        self.preview_text.insert(tk.END, f"策略: {json_data.get('metadata', {}).get('strategy', 'N/A')}\n", "info")
+        self.preview_text.insert(tk.END, f"字数: {json_data.get('metadata', {}).get('char_count', 0)}\n", "info")
+        
+        # ✨ 重点展示 pure_text
+        pure_text = json_data.get('pure_text', '')
+        self.preview_text.insert(tk.END, f"\n[pure_text (字数: {len(pure_text)})]:\n", "highlight")
+        self.preview_text.insert(tk.END, f"{pure_text[:200]}{'...' if len(pure_text) > 200 else ''}\n", "body")
+        
+        # embedding_text 作为参考
+        embedding_text = json_data.get('embedding_text', '')
+        self.preview_text.insert(tk.END, f"\n[embedding_text (字数: {len(embedding_text)})]:\n", "highlight")
+        self.preview_text.insert(tk.END, f"{embedding_text[:200]}{'...' if len(embedding_text) > 200 else ''}\n", "body")
+        
+        self.preview_text.insert(tk.END, "-"*60 + "\n\n")
         self.preview_text.see(tk.END)
 
     def start_etl(self):
@@ -378,7 +425,7 @@ class Day2GUI:
     def on_finished(self, success):
         self.btn_run.config(state="normal", text="▶ 开始 ETL 流水线")
         if success:
-            messagebox.showinfo("完成", f"ETL 处理成功！\n数据已写入 {Day2Config.DB_PATH}")
+            messagebox.showinfo("完成", f"✨ ETL 处理成功！\n数据已写入 {Day2Config.DB_PATH}\n\nJSON 中已包含 pure_text 字段，Day 3 无需再做字符串分割")
         else:
             messagebox.showerror("失败", "ETL 处理过程中发生错误，请查看日志。")
 
